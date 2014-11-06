@@ -11,6 +11,7 @@ import platform
 from time import sleep
 import logging
 import os
+import re
 
 from IPython.nbformat.current import NotebookNode
 from IPython.kernel import KernelManager
@@ -54,7 +55,7 @@ class NotebookRunner(object):
             os.chdir(working_dir)
 
         self.km.start_kernel(extra_arguments = args)
-        
+
         os.chdir(cwd)
 
         if platform.system() == 'Darwin':
@@ -70,31 +71,31 @@ class NotebookRunner(object):
 
         self.shell = self.kc.shell_channel
         self.iopub = self.kc.iopub_channel
-        
+
         self.nb = nb
-        
+
 
     def __del__(self):
         self.kc.stop_channels()
         self.km.shutdown_kernel(now=True)
 
 
-    def run_cell(self, cell):
+    def run_code(self, code):
         '''
         Run a notebook cell and update the output of that cell in-place.
         '''
-        logging.info('Running cell:\n%s\n', cell.input)
-        self.shell.execute(cell.input)
+        self.shell.execute(code)
         reply = self.shell.get_msg()
         status = reply['content']['status']
         if status == 'error':
-            traceback_text = 'Cell raised uncaught exception: \n' + \
+            traceback_text = 'Code raised uncaught exception: \n' + \
                 '\n'.join(reply['content']['traceback'])
             logging.info(traceback_text)
         else:
-            logging.info('Cell returned')
+            logging.info('Code returned')
 
         outs = list()
+        prompt_number = -1
         while True:
             try:
                 msg = self.iopub.get_msg(timeout=1)
@@ -121,7 +122,7 @@ class NotebookRunner(object):
             out = NotebookNode(output_type=msg_type)
 
             if 'execution_count' in content:
-                cell['prompt_number'] = content['execution_count']
+                prompt_number = content['execution_count']
                 out.prompt_number = content['execution_count']
 
             if msg_type in ('status', 'pyin', 'execute_input'):
@@ -151,21 +152,47 @@ class NotebookRunner(object):
             else:
                 raise NotImplementedError('unhandled iopub message: %s' % msg_type)
             outs.append(out)
-        cell['outputs'] = outs
 
         if status == 'error':
             raise NotebookError(traceback_text)
 
+        return (prompt_number, outs)
 
-    def iter_code_cells(self):
+    def run_cell(self, cell, skip_exceptions):
         '''
-        Iterate over the notebook cells containing code.
+        Run a notebook cell and update the output of that cell in-place.
         '''
-        for ws in self.nb.worksheets:
-            for cell in ws.cells:
-                if cell.cell_type == 'code':
-                    yield cell
+        logging.info('Running cell:\n%s\n', cell.input)
+        try:
+            (prompt_number, outs) = self.run_code(cell.input)
+        except NotebookError:
+            if not skip_exceptions:
+                raise
+        cell['prompt_number'] = prompt_number
+        cell['outs'] = outs
 
+
+
+    def pymarkdown_cell(self, cell):
+        '''
+        Go looking for {{this}} inside a markdown cell and add this:value to metadata['variables'].
+        This is the same thing that the python-markdown extension does.
+        '''
+        variables = dict()
+        for expr in re.finditer("{{(.*?)}}", cell.source):
+            code = expr.group(1)
+            variables[code] = ""
+
+            logging.info('Running markdown expression:\n%s\n', expr)
+            try:
+                (prompt_number, outs) = self.run_code(code)
+            except NotebookError:
+                continue #leave the variable empty
+
+            outs = filter( lambda out : out['output_type'] == 'pyout', outs )
+            if len(outs) > 0:
+                variables[code] = outs[0]['text']
+        cell.metadata['variables'] = variables
 
     def run_notebook(self, skip_exceptions=False, progress_callback=None):
         '''
@@ -175,14 +202,16 @@ class NotebookRunner(object):
         If ``skip_exceptions`` is set, then if exceptions occur in a cell, the
         subsequent cells are run (by default, the notebook execution stops).
         '''
-        for i, cell in enumerate(self.iter_code_cells()):
-            try:
-                self.run_cell(cell)
-            except NotebookError:
-                if not skip_exceptions:
-                    raise
-            if progress_callback:
-                progress_callback(i)
+        for ws in self.nb.worksheets:
+            for i, cell in enumerate(ws.cells):
+                logging.info('celltype: %s\n', cell.cell_type)
+                if cell.cell_type == 'code':
+                    self.run_cell(cell, skip_exceptions)
+                    if progress_callback:
+                        progress_callback(i)
+                elif cell.cell_type == 'markdown':
+                    self.pymarkdown_cell(cell)
+
 
 
     def count_code_cells(self):
@@ -190,4 +219,4 @@ class NotebookRunner(object):
         Return the number of code cells in the notebook
         '''
         return sum(1 for _ in self.iter_code_cells())
-        
+

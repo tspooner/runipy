@@ -169,7 +169,7 @@ class NotebookRunner(object):
             if not skip_exceptions:
                 raise
         cell['prompt_number'] = prompt_number
-        cell['outs'] = outs
+        cell['outputs'] = outs
 
 
 
